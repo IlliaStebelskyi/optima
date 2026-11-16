@@ -17,7 +17,7 @@ jobs:
           node-version: 20
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build
         run: npm run build
@@ -27,3 +27,81 @@ jobs:
         with:
           name: build-output
           path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.commit.outputs.short_sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get short commit SHA
+        id: commit
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/nodeapp
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short,prefix=
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Compose configuration
+        uses: actions/checkout@v4
+
+      - name: Copy Compose file to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          fingerprint: ${{ secrets.EC2_HOST_FINGERPRINT }}
+          source: docker-compose.yml
+          target: ${{ secrets.EC2_DEPLOY_PATH }}
+
+      - name: Deploy with Docker Compose
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_PATH: ${{ secrets.EC2_DEPLOY_PATH }}
+          IMAGE_TAG: ${{ secrets.DOCKERHUB_USERNAME }}/nodeapp:${{ needs.publish.outputs.short_sha }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          fingerprint: ${{ secrets.EC2_HOST_FINGERPRINT }}
+          envs: DEPLOY_PATH,IMAGE_TAG,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN
+          script: |
+            set -e
+            cd "$DEPLOY_PATH"
+            echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+            docker rm -f nodeapp || true
+            IMAGE_TAG="$IMAGE_TAG" docker compose pull app
+            IMAGE_TAG="$IMAGE_TAG" docker compose up -d --remove-orphans --no-build
+            docker logout
